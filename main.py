@@ -57,16 +57,16 @@ def get_db_connection():
     return conn
 
 
-# Load label mapping
+# Load label mapping và chỉ lấy ký tự kanji
 with open("kanji_labels.txt", "r", encoding="utf-8") as f:
-    kanji_labels = f.read().splitlines()
+    kanji_labels = [line.split(maxsplit=1)[-1] for line in f.read().splitlines()]
 
 # Thư mục lưu ảnh đầu vào để debug
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def preprocess_image(image_bytes):
-    # 🖼 Mở ảnh và chuyển thành grayscale
+    # Mở ảnh và chuyển thành grayscale
     image = Image.open(io.BytesIO(image_bytes)).convert("L")
 
     #  Lưu ảnh gốc để kiểm tra
