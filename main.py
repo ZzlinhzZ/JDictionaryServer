@@ -7,8 +7,12 @@ import torchvision.transforms as transforms
 from PIL import Image
 import base64
 import io
+import numpy as np
+import cv2
+import os
+from io import BytesIO
 
-# Khởi tạo model (bạn có thể import từ file khác nếu cần)
+# Khởi tạo model 
 class KanjiCNN(torch.nn.Module):
     def __init__(self, num_classes):
         super(KanjiCNN, self).__init__()
@@ -57,14 +61,41 @@ def get_db_connection():
 with open("kanji_labels.txt", "r", encoding="utf-8") as f:
     kanji_labels = f.read().splitlines()
 
-# Hàm tiền xử lý ảnh
+# Thư mục lưu ảnh đầu vào để debug
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 def preprocess_image(image_bytes):
+    # 🖼 Mở ảnh và chuyển thành grayscale
     image = Image.open(io.BytesIO(image_bytes)).convert("L")
+
+    #  Lưu ảnh gốc để kiểm tra
+    image.save(os.path.join(UPLOAD_FOLDER, "original_received.png"))
+
+    # Chuyển sang numpy để xử lý với OpenCV
+    img_np = np.array(image)
+
+    # Binarization (Nhị phân hóa ảnh)
+    _, img_bin = cv2.threshold(img_np, 128, 255, cv2.THRESH_BINARY)
+
+    # Kiểm tra nền trắng hay đen, nếu nền trắng thì đảo ngược
+    white_pixel_count = np.sum(img_bin == 255)
+    black_pixel_count = np.sum(img_bin == 0)
+    if white_pixel_count > black_pixel_count:
+        img_bin = cv2.bitwise_not(img_bin)
+
+    #  Resize về 64x64
+    img_resized = cv2.resize(img_bin, (64, 64), interpolation=cv2.INTER_AREA)
+
+    #  Lưu ảnh sau khi tiền xử lý để kiểm tra
+    Image.fromarray(img_resized).save(os.path.join(UPLOAD_FOLDER, "processed_image.png"))
+
+    # Chuyển sang tensor
     transform = transforms.Compose([
-        transforms.Resize((64, 64)),
         transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))  # Chuẩn hóa dữ liệu
     ])
-    return transform(image).unsqueeze(0)
+    return transform(Image.fromarray(img_resized)).unsqueeze(0)
 
 @app.post("/recognize-kanji")
 async def recognize_kanji(image: dict):
@@ -73,18 +104,25 @@ async def recognize_kanji(image: dict):
         image_bytes = base64.b64decode(image["image"])
         input_tensor = preprocess_image(image_bytes)
 
-        # Dự đoán
+        # Dự đoán với model
         with torch.no_grad():
             output = model(input_tensor)
             probabilities = torch.nn.functional.softmax(output[0], dim=0)
             top10 = torch.topk(probabilities, 10)
 
-        # Lấy top 10 kanji dự đoán
+        # Lấy top 10 Kanji dự đoán
         top_kanji = [kanji_labels[idx] for idx in top10.indices.tolist()]
-        return JSONResponse(content={"predictions": top_kanji})
+        top_probs = top10.values.tolist()
+
+        # 🖨 Ghi log dự đoán
+        print("Top 10 Kanji dự đoán:", top_kanji)
+        print("Xác suất:", top_probs)
+
+        return JSONResponse(content={"predictions": top_kanji, "probabilities": top_probs})
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 @app.get("/words")
 def get_words(search: str = ""):

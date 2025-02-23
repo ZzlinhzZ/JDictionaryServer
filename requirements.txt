@@ -1,0 +1,8 @@
+fastapi
+sqlite3
+fastapi[all]
+torch
+torchvision
+Pillow
+numpy
+opencv-python
