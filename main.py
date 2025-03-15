@@ -103,20 +103,22 @@ def preprocess_image(image_bytes):
     ])
     return transform(Image.fromarray(img_resized)).unsqueeze(0)
 
-def get_current_user(token: str = Depends(security)):
+async def get_current_user(token: str = Depends(HTTPBearer())):
     conn = get_db_connection()
-    user = conn.execute(
-        "SELECT id FROM users WHERE token = ?",
-        (token.credentials,)
-    ).fetchone()
-    conn.close()
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials"
-        )
-    return user
+    try:
+        user = conn.execute(
+            "SELECT * FROM users WHERE token = ?",
+            (token.credentials,)
+        ).fetchone()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials"
+            )
+        return dict(user)  # Chuyển đổi sang dictionary
+    finally:
+        conn.close()
 
 @app.post("/recognize-kanji")
 async def recognize_kanji(image: dict):
@@ -226,30 +228,37 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
+class CommentCreate(BaseModel):
+    content: str
+    kanji: str
+
+class CommentVote(BaseModel):
+    action: str  # 'like' or 'dislike'
+
 # Khởi tạo password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Tạo bảng users trong SQLite (thêm vào đầu file)
-# def init_db():
-#     conn = sqlite3.connect("dictionary.db")
+def init_db():
+    conn = sqlite3.connect("dictionary.db")
 
-#     conn.execute("DROP TABLE IF EXISTS saved_kanji")  # Xóa bảng nếu tồn tại
-#     conn.commit()
-#     conn.execute("""
-#         CREATE TABLE IF NOT EXISTS saved_kanji (
-#             id INTEGER PRIMARY KEY AUTOINCREMENT,
-#             user_id INTEGER NOT NULL,
-#             kanji TEXT NOT NULL,
-#             pronounced TEXT NOT NULL,
-#             meaning TEXT NOT NULL,
-#             FOREIGN KEY(user_id) REFERENCES users(id)
-#         )
-#     """)
-#     conn.commit()
-#     conn.close()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kanji TEXT NOT NULL,
+            content TEXT NOT NULL,
+            likes INTEGER DEFAULT 0,
+            dislikes INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# # Gọi hàm init_db khi khởi động
-# init_db()
+# Gọi hàm init_db khi khởi động
+init_db()
 
 
 # Thêm các endpoints mới
@@ -322,27 +331,101 @@ async def logout(authorization:  str = Header(None)):
     conn.close()
     return {"message": "Logged out successfully"}
 
-@app.get("/me")
-async def get_current_user(token: str = Header(None)):
-    if not token:
-        return JSONResponse(
-            content={"error": "Not authenticated"},
-            status_code=401
-        )
+# @app.get("/me")
+# async def get_current_user(token: str = Header(None)):
+#     if not token:
+#         return JSONResponse(
+#             content={"error": "Not authenticated"},
+#             status_code=401
+#         )
     
+#     conn = get_db_connection()
+#     user = conn.execute(
+#         "SELECT username, email FROM users WHERE token = ?",
+#         (token,)
+#     ).fetchone()
+#     conn.close()
+    
+#     if not user:
+#         return JSONResponse(
+#             content={"error": "Invalid token"},
+#             status_code=401
+#         )
+    
+#     return {"username": user["username"], "email": user["email"]}
+
+
+@app.post("/comments")
+async def create_comment(
+    comment: CommentCreate,
+    current_user: dict = Depends(get_current_user)  # Đảm bảo luôn trả về dictionary
+):
     conn = get_db_connection()
-    user = conn.execute(
-        "SELECT username, email FROM users WHERE token = ?",
-        (token,)
-    ).fetchone()
-    conn.close()
-    
-    if not user:
+    try:
+        conn.execute(
+            "INSERT INTO comments (user_id, kanji, content) VALUES (?, ?, ?)",
+            (current_user["id"], comment.kanji, comment.content)
+        )
+        conn.commit()
+        return {"message": "Comment added"}
+    except sqlite3.IntegrityError as e:
         return JSONResponse(
-            content={"error": "Invalid token"},
-            status_code=401
+            content={"error": str(e)},
+            status_code=400
+        )
+    finally:
+        conn.close()
+
+@app.get("/comments/{kanji}")
+async def get_comments(
+    kanji: str,
+    page: int = 1,
+    limit: int = 5
+):
+    conn = get_db_connection()
+    offset = (page - 1) * limit
+    
+    comments = conn.execute("""
+        SELECT c.*, u.username 
+        FROM comments c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.kanji = ?
+        ORDER BY (c.likes - c.dislikes) DESC
+        LIMIT ? OFFSET ?
+    """, (kanji, limit, offset)).fetchall()
+    
+    total = conn.execute(
+        "SELECT COUNT(*) FROM comments WHERE kanji = ?",
+        (kanji,)
+    ).fetchone()[0]
+    
+    conn.close()
+    return {
+        "comments": [dict(c) for c in comments],
+        "total": total,
+        "page": page,
+        "total_pages": (total + limit - 1) // limit
+    }
+
+@app.post("/comments/{comment_id}/vote")
+async def vote_comment(
+    comment_id: int,
+    vote: CommentVote,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = get_db_connection()
+    
+    if vote.action == 'like':
+        conn.execute(
+            "UPDATE comments SET likes = likes + 1 WHERE id = ?",
+            (comment_id,)
+        )
+    elif vote.action == 'dislike':
+        conn.execute(
+            "UPDATE comments SET dislikes = dislikes + 1 WHERE id = ?",
+            (comment_id,)
         )
     
-    return {"username": user["username"], "email": user["email"]}
-
-
+    conn.commit()
+    conn.close()
+    return {"message": "Vote updated"}
