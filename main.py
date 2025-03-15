@@ -243,15 +243,13 @@ def init_db():
     conn = sqlite3.connect("dictionary.db")
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS votes (
             user_id INTEGER NOT NULL,
-            kanji TEXT NOT NULL,
-            content TEXT NOT NULL,
-            likes INTEGER DEFAULT 0,
-            dislikes INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            comment_id INTEGER NOT NULL,
+            action TEXT CHECK(action IN ('like', 'dislike')),
+            PRIMARY KEY(user_id, comment_id),
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(comment_id) REFERENCES comments(id)
         )
     """)
     conn.commit()
@@ -380,19 +378,24 @@ async def create_comment(
 async def get_comments(
     kanji: str,
     page: int = 1,
-    limit: int = 5
+    limit: int = 5,
+    current_user: dict = Depends(get_current_user)
 ):
     conn = get_db_connection()
     offset = (page - 1) * limit
     
     comments = conn.execute("""
-        SELECT c.*, u.username 
+        SELECT 
+            c.*, 
+            u.username,
+            v.action as user_vote
         FROM comments c
-        JOIN users u ON c.user_id = u.id
+        LEFT JOIN users u ON c.user_id = u.id
+        LEFT JOIN votes v ON v.comment_id = c.id AND v.user_id = ?
         WHERE c.kanji = ?
         ORDER BY (c.likes - c.dislikes) DESC
         LIMIT ? OFFSET ?
-    """, (kanji, limit, offset)).fetchall()
+    """, (current_user["id"], kanji, limit, offset)).fetchall()
     
     total = conn.execute(
         "SELECT COUNT(*) FROM comments WHERE kanji = ?",
@@ -414,18 +417,52 @@ async def vote_comment(
     current_user: dict = Depends(get_current_user)
 ):
     conn = get_db_connection()
-    
-    if vote.action == 'like':
-        conn.execute(
-            "UPDATE comments SET likes = likes + 1 WHERE id = ?",
-            (comment_id,)
-        )
-    elif vote.action == 'dislike':
-        conn.execute(
-            "UPDATE comments SET dislikes = dislikes + 1 WHERE id = ?",
-            (comment_id,)
-        )
-    
-    conn.commit()
-    conn.close()
-    return {"message": "Vote updated"}
+    try:
+        # Kiểm tra vote hiện tại
+        current_vote = conn.execute(
+            "SELECT action FROM votes WHERE user_id = ? AND comment_id = ?",
+            (current_user["id"], comment_id)
+        ).fetchone()
+
+        # Xử lý các trường hợp
+        if current_vote:
+            if current_vote["action"] == vote.action:
+                # Hủy vote nếu trùng hành động
+                conn.execute(
+                    "DELETE FROM votes WHERE user_id = ? AND comment_id = ?",
+                    (current_user["id"], comment_id)
+                )
+                # Giảm count
+                conn.execute(f"""
+                    UPDATE comments SET {vote.action}s = {vote.action}s - 1 
+                    WHERE id = ?
+                """, (comment_id,))
+            else:
+                # Đổi từ like sang dislike hoặc ngược lại
+                conn.execute(
+                    "UPDATE votes SET action = ? WHERE user_id = ? AND comment_id = ?",
+                    (vote.action, current_user["id"], comment_id)
+                )
+                # Giảm action cũ, tăng action mới
+                conn.execute(f"""
+                    UPDATE comments 
+                    SET {current_vote["action"]}s = {current_vote["action"]}s - 1,
+                        {vote.action}s = {vote.action}s + 1 
+                    WHERE id = ?
+                """, (comment_id,))
+        else:
+            # Thêm vote mới
+            conn.execute(
+                "INSERT INTO votes (user_id, comment_id, action) VALUES (?, ?, ?)",
+                (current_user["id"], comment_id, vote.action)
+            )
+            # Tăng count
+            conn.execute(f"""
+                UPDATE comments SET {vote.action}s = {vote.action}s + 1 
+                WHERE id = ?
+            """, (comment_id,))
+
+        conn.commit()
+        return {"message": "Vote updated"}
+    finally:
+        conn.close()
