@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, Header, Depends, HTTPException, status
+from fastapi.security import HTTPBearer
 import sqlite3
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,7 +11,12 @@ import io
 import numpy as np
 import cv2
 import os
-from io import BytesIO
+
+from pydantic import BaseModel
+from passlib.context import CryptContext
+import secrets
+
+security = HTTPBearer()
 
 # Khởi tạo model 
 class KanjiCNN(torch.nn.Module):
@@ -97,6 +103,21 @@ def preprocess_image(image_bytes):
     ])
     return transform(Image.fromarray(img_resized)).unsqueeze(0)
 
+def get_current_user(token: str = Depends(security)):
+    conn = get_db_connection()
+    user = conn.execute(
+        "SELECT id FROM users WHERE token = ?",
+        (token.credentials,)
+    ).fetchone()
+    conn.close()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+    return user
+
 @app.post("/recognize-kanji")
 async def recognize_kanji(image: dict):
     try:
@@ -152,27 +173,176 @@ def get_kanji():
     return [dict(k) for k in kanji]
 
 @app.post("/save_kanji")
-def save_kanji(data: dict):
+def save_kanji(data: dict, current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
-    conn.execute(
-        "INSERT INTO saved_kanji (kanji, pronounced, meaning) VALUES (?, ?, ?)",
-        (data["kanji"], data["pronounced"], data["meaning"]),
-    )
-    conn.commit()
-    conn.close()
-    return {"message": "Kanji saved successfully"}
+    try:
+        conn.execute(
+            "INSERT INTO saved_kanji (user_id, kanji, pronounced, meaning) VALUES (?, ?, ?, ?)",
+            (current_user["id"], data["kanji"], data["pronounced"], data["meaning"]),
+        )
+        conn.commit()
+        return {"message": "Kanji saved successfully"}
+    except sqlite3.IntegrityError:
+        return JSONResponse(
+            content={"error": "Kanji already exists"},
+            status_code=400
+        )
+    finally:
+        conn.close()
 
 @app.delete("/delete_kanji/{kanji}")
-def delete_kanji(kanji: str):
+def delete_kanji(kanji: str, current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
-    conn.execute("DELETE FROM saved_kanji WHERE kanji = ?", (kanji,))
+    conn.execute(
+        "DELETE FROM saved_kanji WHERE kanji = ? AND user_id = ?",
+        (kanji, current_user["id"])
+    )
     conn.commit()
     conn.close()
     return {"message": "Kanji removed"}
     
+
 @app.get("/saved_kanji")
-def get_saved_kanji():
+def get_saved_kanji(current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
-    kanji = conn.execute("SELECT * FROM saved_kanji").fetchall()
+    kanji = conn.execute(
+        "SELECT * FROM saved_kanji WHERE user_id = ?",
+        (current_user["id"],)
+    ).fetchall()
     conn.close()
     return [dict(k) for k in kanji]
+
+
+
+#######################################################################
+
+# Thêm class cho dữ liệu đăng nhập/đăng ký
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    email: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+# Khởi tạo password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Tạo bảng users trong SQLite (thêm vào đầu file)
+# def init_db():
+#     conn = sqlite3.connect("dictionary.db")
+
+#     conn.execute("DROP TABLE IF EXISTS saved_kanji")  # Xóa bảng nếu tồn tại
+#     conn.commit()
+#     conn.execute("""
+#         CREATE TABLE IF NOT EXISTS saved_kanji (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             user_id INTEGER NOT NULL,
+#             kanji TEXT NOT NULL,
+#             pronounced TEXT NOT NULL,
+#             meaning TEXT NOT NULL,
+#             FOREIGN KEY(user_id) REFERENCES users(id)
+#         )
+#     """)
+#     conn.commit()
+#     conn.close()
+
+# # Gọi hàm init_db khi khởi động
+# init_db()
+
+
+# Thêm các endpoints mới
+@app.post("/register")
+async def register(user: UserCreate):
+    conn = get_db_connection()
+    hashed_password = pwd_context.hash(user.password)
+    token = secrets.token_hex(16)
+    
+    try:
+        conn.execute(
+            "INSERT INTO users (username, email, password, token) VALUES (?, ?, ?, ?)",
+            (user.username, user.email, hashed_password, token)
+        )
+        conn.commit()
+        return {"message": "User created", "token": token}
+    except sqlite3.IntegrityError:
+        return JSONResponse(
+            content={"error": "Username or email already exists"},
+            status_code=400
+        )
+    finally:
+        conn.close()
+
+@app.post("/login")
+async def login(user: UserLogin):
+    conn = get_db_connection()
+    db_user = conn.execute(
+        "SELECT * FROM users WHERE username = ?", 
+        (user.username,)
+    ).fetchone()
+    
+    if not db_user or not pwd_context.verify(user.password, db_user["password"]):
+        return JSONResponse(
+            content={"error": "Invalid credentials"},
+            status_code=401
+        )
+    
+    new_token = secrets.token_hex(16)
+    conn.execute(
+        "UPDATE users SET token = ? WHERE id = ?",
+        (new_token, db_user["id"])
+    )
+    conn.commit()
+    conn.close()
+    
+    return {"message": "Login successful", "token": new_token}
+
+@app.post("/logout")
+async def logout(authorization:  str = Header(None)):
+    if not authorization: 
+        return JSONResponse(
+            content={"error": "Token missing"},
+            status_code=401
+        )
+        # Extract token từ header (Bearer <token>)
+    try:
+        token = authorization.split(" ")[1]
+    except IndexError:
+        return JSONResponse(
+            content={"error": "Invalid token format"},
+            status_code=401
+        )
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE users SET token = NULL WHERE token = ?",
+        (token,)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Logged out successfully"}
+
+@app.get("/me")
+async def get_current_user(token: str = Header(None)):
+    if not token:
+        return JSONResponse(
+            content={"error": "Not authenticated"},
+            status_code=401
+        )
+    
+    conn = get_db_connection()
+    user = conn.execute(
+        "SELECT username, email FROM users WHERE token = ?",
+        (token,)
+    ).fetchone()
+    conn.close()
+    
+    if not user:
+        return JSONResponse(
+            content={"error": "Invalid token"},
+            status_code=401
+        )
+    
+    return {"username": user["username"], "email": user["email"]}
+
+
